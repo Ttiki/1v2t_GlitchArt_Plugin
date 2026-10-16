@@ -68,7 +68,26 @@ kernel void datamoshComposite(texture2d<float, access::read> current [[texture(0
     int2 point = int2(index) + u.destinationRect.xy;
     float4 original = moshRead(current, point, u.currentRect, u.origins.x, u.imageInfo.xy);
     float4 result = original;
-    if (u.controls.x > 0 && u.controls.z > 0) {
+    if (u.random.y == 1) {
+        float t = clamp(u.controls.w, 0.0f, 1.0f);
+        float4 outgoing = moshRead(history, point, u.historyRect, u.origins.z, u.imageInfo.xy);
+        // Exact endpoints avoid a residual dissolve or displaced pixels at the cut boundaries.
+        result = t <= 0 ? outgoing : (t >= 1 ? original : mix(outgoing, original, t));
+        if (t > 0 && t < 1 && u.controls.x > 0 && u.controls.z > 0) {
+            int2 block = point / u.imageInfo.z;
+            uint key = moshHash(uint(block.x) ^ moshHash(uint(block.y)) ^ moshHash(u.random.x));
+            float chance = float(key & 0x00ffffffu) / 16777216.0f;
+            int2 local = block - u.grid.xy;
+            int2 vector = vectors[local.y * u.grid.z + local.x];
+            float envelope = sin(t * 3.14159265359f);
+            int2 displaced = clamp(point + int2(round(float2(vector) * u.controls.y * 8.0f * envelope)),
+                                   int2(0), u.imageInfo.xy - 1);
+            float4 smeared = moshRead(history, displaced, u.historyRect, u.origins.z, u.imageInfo.xy);
+            float reveal = smoothstep(0.08f + chance*0.72f, 0.20f + chance*0.72f, t);
+            float4 blocks = mix(smeared, original, reveal);
+            result = mix(result, blocks, u.controls.x*u.controls.z*envelope);
+        }
+    } else if (u.controls.x > 0 && u.controls.z > 0) {
         int2 block = point / u.imageInfo.z;
         uint key = moshHash(uint(block.x) ^ moshHash(uint(block.y)) ^ moshHash(u.random.x));
         float chance = float(key & 0x00ffffffu) / 16777216.0f;

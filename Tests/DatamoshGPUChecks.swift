@@ -115,5 +115,47 @@ import simd
         let replaced=try render(u,cropped:false,old:current)
         precondition(replaced == current && replaced != frozen,"Changing only the history frame must change the temporal result")
         print("PASS: \(cases) Datamosh GPU/reference cases plus delayed-frame replacement and deterministic replay.")
+        var transitionCases = 0
+        for progress: Float in [0,0.2,0.5,0.8,1] {
+            for origin: Int32 in [0,1] { for motion: Float in [0,0.75] {
+                u.origins = SIMD4(origin,1-origin,origin,1-origin)
+                u.controls = SIMD4(0.85,motion,1,progress); u.random = SIMD4(7,1,0,0)
+                let full = try render(u,cropped:false,old:history)
+                let tile = try render(u,cropped:true,old:history)
+                let replay = try render(u,cropped:false,old:history)
+                precondition(full == replay,"Transition seeking must be deterministic")
+                for y in 0..<(h-18) { for x in 0..<(w-22) {
+                    precondition(simd_reduce_max(abs(tile[y*(w-22)+x]-full[(y+9)*w+x+11])) < 0.00002,"Transition tile seam")
+                }}
+                if progress == 0 { precondition(full == history,"Transition must start exactly at A") }
+                if progress == 1 { precondition(full == current,"Transition must end exactly at B") }
+                if motion == 0 {
+                    func smooth(_ low: Float, _ high: Float, _ value: Float) -> Float {
+                        let x = max(0,min(1,(value-low)/(high-low))); return x*x*(3-2*x)
+                    }
+                    for i in 0..<(w*h) {
+                        let k = hash(UInt32((i%w)/8) ^ hash(UInt32((i/w)/8)) ^ hash(7))
+                        let n = Float(k & 0xffffff)/16777216
+                        let reveal = smooth(0.08+n*0.72,0.20+n*0.72,progress)
+                        let dissolve = history[i]+(current[i]-history[i])*progress
+                        let blocks = history[i]+(current[i]-history[i])*reveal
+                        let expected = dissolve+(blocks-dissolve)*(0.85*sin(progress*Float.pi))
+                        precondition(simd_reduce_max(abs(full[i]-expected)) < 0.00002,"Transition reveal mismatch")
+                    }
+                }
+                if progress == 0.5 {
+                    let dissolve = zip(history,current).map { ($0+$1)*0.5 }
+                    precondition(zip(full,dissolve).contains { simd_reduce_max(abs($0-$1)) > 0.01 },"Transition should break up the dissolve")
+                    for bypass in [SIMD4<Float>(0,motion,1,progress), SIMD4<Float>(1,motion,0,progress)] {
+                        u.controls = bypass
+                        let plain = try render(u,cropped:false,old:history)
+                        precondition(zip(plain,dissolve).allSatisfy { simd_reduce_max(abs($0-$1)) < 0.00002 },"Amount/Mix zero must retain the underlying transition")
+                    }
+                }
+                transitionCases += 1
+            }}
+        }
+        print("PASS: \(transitionCases) transition cases: endpoints, block reveal, tiles, origins, bypass, and replay.")
+
     }
 }

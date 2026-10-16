@@ -63,8 +63,8 @@ typedef struct DatamoshUniforms {
     vector_int4 imageInfo; // full width, height, block size, search step
     vector_int4 origins; // current, previous, history, output top-origin flags
     vector_int4 grid; // first block x/y, grid width/height
-    vector_float4 controls; // selected block proportion, motion strength, mix, unused
-    vector_uint4 random; // seed, unused fields
+    vector_float4 controls; // selected block proportion, motion strength, mix, transition progress
+    vector_uint4 random; // seed, transition mode (1), unused fields
 } DatamoshUniforms;
 
 #endif /* TileableRemoteBrightnessShaderTypes_h */

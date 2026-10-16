@@ -178,3 +178,172 @@ private struct MoshState: Codable {
         if command.status != .completed { throw command.error ?? pixelSortError("Datamosh GPU rendering failed.") }
     }
 }
+
+
+// Two image wells let a Motion Final Cut Transition template supply both scene placeholders.
+// Progress is animated 0–1 in the template; render state remains independent of playback order.
+private struct MoshTransitionState: Codable {
+    var amount = 0.85
+    var block = 32.0
+    var motion = 0.5
+    var seed = 1.0
+    var mix = 1.0
+    var progress = 0.0
+    var previous = MoshTime(.zero)
+}
+
+@objc(DatamoshTransitionPlugIn) final class DatamoshTransitionPlugIn: PixelSortPlugIn {
+    override func addParameters() throws {
+        guard let api = apiManager.api(for: FxParameterCreationAPI_v5.self) as? FxParameterCreationAPI_v5 else {
+            throw pixelSortError("Datamosh Transition controls are unavailable.")
+        }
+        let flags = FxParameterFlags(kFxParameterFlag_DEFAULT)
+        func slider(_ name: String, _ id: UInt32, _ value: Double, _ low: Double = 0, _ high: Double = 1, _ step: Double = 0.01) -> Bool {
+            api.addFloatSlider(withName: name, parameterID: id, defaultValue: value, parameterMin: low, parameterMax: high, sliderMin: low, sliderMax: high, delta: step, parameterFlags: flags)
+        }
+        let results = [api.addImageReference(withName: "Scene A", parameterID: 40, parameterFlags: flags),
+                       api.addImageReference(withName: "Scene B", parameterID: 41, parameterFlags: flags),
+                       slider("Progress", 42, 0), slider("Amount", 43, 0.85),
+                       slider("Block Size", 44, 32, 8, 128, 1), slider("Motion", 45, 0.5),
+                       slider("Seed", 46, 1, 0, 10000, 1), slider("Mix", 47, 1)]
+        guard results.allSatisfy({ $0 }) else { throw pixelSortError("Unable to create Datamosh Transition controls.") }
+    }
+
+    override func properties(_ properties: AutoreleasingUnsafeMutablePointer<NSDictionary>?) throws {
+        properties?.pointee = [kFxPropertyKey_MayRemapTime: true,
+                              kFxPropertyKey_PixelTransformSupport: kFxPixelTransform_ScaleTranslate,
+                              kFxPropertyKey_VariesWhenParamsAreStatic: true] as NSDictionary
+    }
+
+    override func pluginState(_ pluginState: AutoreleasingUnsafeMutablePointer<NSData>?, at renderTime: CMTime, quality qualityLevel: UInt) throws {
+        guard let api = apiManager.api(for: FxParameterRetrievalAPI_v6.self) as? FxParameterRetrievalAPI_v6 else {
+            throw pixelSortError("Datamosh Transition parameters are unavailable.")
+        }
+        var s = MoshTransitionState()
+        let results = [api.getFloatValue(&s.progress, fromParameter: 42, at: renderTime),
+                       api.getFloatValue(&s.amount, fromParameter: 43, at: renderTime),
+                       api.getFloatValue(&s.block, fromParameter: 44, at: renderTime),
+                       api.getFloatValue(&s.motion, fromParameter: 45, at: renderTime),
+                       api.getFloatValue(&s.seed, fromParameter: 46, at: renderTime),
+                       api.getFloatValue(&s.mix, fromParameter: 47, at: renderTime)]
+        guard results.allSatisfy({ $0 }) else { throw pixelSortError("Unable to read Datamosh Transition controls.") }
+        func clamp(_ x: Double, _ low: Double, _ high: Double) -> Double { x.isFinite ? min(high, max(low, x)) : low }
+        s.progress = clamp(s.progress,0,1); s.amount = clamp(s.amount,0,1)
+        s.motion = clamp(s.motion,0,1); s.mix = clamp(s.mix,0,1)
+        s.block = clamp(s.block,8,128).rounded(); s.seed = clamp(s.seed,0,10000).rounded()
+        s.previous = MoshTime(renderTime)
+        if s.progress > 0 && s.progress < 1 && s.amount*s.motion*s.mix > 0,
+           let timing = apiManager.api(for: FxTimingAPI_v4.self) as? FxTimingAPI_v4 {
+            var duration = CMTime.invalid, start = CMTime.invalid
+            timing.frameDuration(&duration); timing.startTimeOfInput(toFilter: &start)
+            if duration.isNumeric && start.isNumeric && CMTimeCompare(duration,.zero) > 0 {
+                s.previous = MoshTime(try DatamoshTiming.past(render: renderTime, start: start, duration: duration, frames: 1).previous)
+            }
+        }
+        pluginState?.pointee = try JSONEncoder().encode(s) as NSData
+    }
+
+    private func transitionState(_ data: Data?) throws -> MoshTransitionState {
+        guard let data = data else { throw pixelSortError("Missing Datamosh Transition state.") }
+        return try JSONDecoder().decode(MoshTransitionState.self, from: data)
+    }
+
+    func scheduleInputs(_ inputImageRequests: AutoreleasingUnsafeMutablePointer<NSArray?>?, withPluginState pluginState: Data?, at renderTime: CMTime) throws {
+        let s = try transitionState(pluginState)
+        var inputs: [(UInt32, CMTime)] = [(40,renderTime),(41,renderTime)]
+        if CMTimeCompare(s.previous.time,renderTime) != 0 { inputs.append((41,s.previous.time)) }
+        inputImageRequests?.pointee = try inputs.map { id, time in
+            guard let request = FxImageTileRequest(source: kFxImageTileRequestSourceParameter, time: time, includeFilters: true, parameterID: id) else {
+                throw pixelSortError("Unable to request Datamosh Transition scenes.")
+            }
+            return request
+        } as NSArray
+    }
+
+    override func destinationImageRect(_ destinationImageRect: UnsafeMutablePointer<FxRect>, sourceImages: [FxImageTile], destinationImage: FxImageTile, pluginState: Data?, at renderTime: CMTime) throws {
+        guard let a = sourceImages.first(where: { $0.parameterID == 40 }) else { throw pixelSortError("Scene A is unavailable.") }
+        destinationImageRect.pointee = a.imagePixelBounds
+    }
+
+    override func sourceTileRect(_ sourceTileRect: UnsafeMutablePointer<FxRect>, sourceImageIndex: UInt, sourceImages: [FxImageTile], destinationTileRect: FxRect, destinationImage: FxImageTile, pluginState: Data?, at renderTime: CMTime) throws {
+        guard Int(sourceImageIndex) < sourceImages.count else { throw pixelSortError("Missing transition input.") }
+        // Full inputs avoid seams and support independently positioned image-well canvases.
+        // This first implementation favors correctness over input-memory optimization.
+        sourceTileRect.pointee = sourceImages[Int(sourceImageIndex)].imagePixelBounds
+    }
+
+    override func renderDestinationImage(_ destinationImage: FxImageTile, sourceImages: [FxImageTile], pluginState: Data?, at renderTime: CMTime) throws {
+        let s = try transitionState(pluginState)
+        guard let current = sourceImages.first(where: { $0.parameterID == 41 && CMTimeCompare($0.mediaTime, renderTime) == 0 }),
+              let history = sourceImages.first(where: { $0.parameterID == 40 && CMTimeCompare($0.mediaTime, renderTime) == 0 }),
+              current.requestError == nil, history.requestError == nil,
+              let device = MTLCopyAllDevices().first(where: { $0.registryID == destinationImage.deviceRegistryID }),
+              current.deviceRegistryID == device.registryID, history.deviceRegistryID == device.registryID,
+              let input = current.metalTexture(for: device),
+              let past = history.metalTexture(for: device),
+              let output = destinationImage.metalTexture(for: device) else {
+            throw pixelSortError("Connect Scene A and Scene B to the Datamosh Transition image wells.")
+        }
+        let image = history.imagePixelBounds
+        guard current.imagePixelBounds.right-current.imagePixelBounds.left == image.right-image.left,
+              current.imagePixelBounds.top-current.imagePixelBounds.bottom == image.top-image.bottom else {
+            throw pixelSortError("Scene A and Scene B must have matching canvas dimensions. Use project-sized groups in Motion.")
+        }
+        var previous = sourceImages.first(where: {
+            $0.parameterID == 41 && CMTimeCompare($0.mediaTime, s.previous.time) == 0 && $0.requestError == nil &&
+            $0.deviceRegistryID == device.registryID &&
+            $0.imagePixelBounds.right-$0.imagePixelBounds.left == image.right-image.left &&
+            $0.imagePixelBounds.top-$0.imagePixelBounds.bottom == image.top-image.bottom
+        }) ?? current
+        var prior = input
+        if let texture = previous.metalTexture(for: device) { prior = texture } else { previous = current }
+        let gpu = try MetalDeviceCache.deviceCache.gpu(registryID:device.registryID,format:output.pixelFormat)
+        let bounds = destinationImage.tilePixelBounds
+        let width = Int(bounds.right-bounds.left), height = Int(bounds.top-bounds.bottom)
+        guard width > 0 && height > 0 else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba32Float,width:width,height:height,mipmapped:false)
+        descriptor.storageMode = .private; descriptor.usage = [.shaderRead,.shaderWrite]
+        guard let intermediate = device.makeTexture(descriptor:descriptor), let command = gpu.queue.makeCommandBuffer() else { throw pixelSortError("Unable to allocate Datamosh output.") }
+        func relative(_ r: FxRect, _ origin: FxRect) -> SIMD4<Int32> { SIMD4(r.left-origin.left,r.bottom-origin.bottom,r.right-r.left,r.top-r.bottom) }
+        var u = DatamoshUniforms()
+        u.currentRect = relative(current.tilePixelBounds,current.imagePixelBounds)
+        u.previousRect = relative(previous.tilePixelBounds,previous.imagePixelBounds)
+        u.historyRect = relative(history.tilePixelBounds,history.imagePixelBounds)
+        u.destinationRect = relative(bounds,image)
+        let block = Int32(s.block)
+        u.imageInfo = SIMD4(image.right-image.left,image.top-image.bottom,block,max(1,block/8))
+        u.origins = SIMD4(current.imageOrigin == kFxImageOrigin_TOP_LEFT ? 1 : 0,previous.imageOrigin == kFxImageOrigin_TOP_LEFT ? 1 : 0,history.imageOrigin == kFxImageOrigin_TOP_LEFT ? 1 : 0,destinationImage.imageOrigin == kFxImageOrigin_TOP_LEFT ? 1 : 0)
+        let firstX = u.destinationRect.x/block, firstY = u.destinationRect.y/block
+        u.grid = SIMD4(firstX,firstY,(u.destinationRect.x+u.destinationRect.z+block-1)/block-firstX,(u.destinationRect.y+u.destinationRect.w+block-1)/block-firstY)
+        // Transition mode reuses outgoing A as history and incoming B for motion.
+        u.controls = SIMD4(Float(s.amount),Float(s.motion),Float(s.mix),Float(s.progress))
+        u.random = SIMD4(UInt32(s.seed),1,0,0)
+        try gpu.encodeDatamosh(command:command,current:input,previous:prior,history:past,destination:intermediate,uniforms:u)
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = output
+        pass.colorAttachments[0].loadAction = .dontCare
+        // Explicitly retain the rendered image for the host after the pass finishes.
+        pass.colorAttachments[0].storeAction = .store
+        guard let render = command.makeRenderCommandEncoder(descriptor: pass) else {
+            throw pixelSortError("Unable to create the output render encoder.")
+        }
+        var vertices = [
+            Vertex2D(position: SIMD2(Float(width)/2, -Float(height)/2), textureCoordinate: SIMD2(1, 1)),
+            Vertex2D(position: SIMD2(-Float(width)/2, -Float(height)/2), textureCoordinate: SIMD2(0, 1)),
+            Vertex2D(position: SIMD2(Float(width)/2, Float(height)/2), textureCoordinate: SIMD2(1, 0)),
+            Vertex2D(position: SIMD2(-Float(width)/2, Float(height)/2), textureCoordinate: SIMD2(0, 0))
+        ]
+        var viewport = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        render.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(width), height: Double(height), znear: -1, zfar: 1))
+        render.setRenderPipelineState(gpu.render)
+        render.setVertexBytes(&vertices, length: MemoryLayout<Vertex2D>.stride * 4, index: 0)
+        render.setVertexBytes(&viewport, length: MemoryLayout.size(ofValue: viewport), index: 1)
+        render.setFragmentTexture(intermediate, index: 0)
+        render.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        render.endEncoding()
+        command.commit()
+        // FxPlug must not consume the output before GPU writes finish.
+        command.waitUntilCompleted()
+        if command.status != .completed { throw command.error ?? pixelSortError("Datamosh GPU rendering failed.") }
+    }
+}

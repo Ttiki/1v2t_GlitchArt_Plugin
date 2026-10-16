@@ -127,6 +127,24 @@
 			<key>version</key>
 			<string>1.0</string>
 		</dict>
+		<dict>
+			<key>className</key>
+			<string>DatamoshTransitionPlugIn</string>
+			<key>displayName</key>
+			<string>Datamosh Transition</string>
+			<key>group</key>
+			<string>D271DD32-D21C-4A0C-86D7-BD01DD3F5E59</string>
+			<key>infoString</key>
+			<string>Two-scene datamosh renderer for a Motion Final Cut Transition template.</string>
+			<key>protocolNames</key>
+			<array>
+				<string>FxFilter</string>
+			</array>
+			<key>uuid</key>
+			<string>9D675C61-C69B-44C4-BC37-49B27C419E9B</string>
+			<key>version</key>
+			<string>1.0</string>
+		</dict>
 	</array>
 	<key>XPCService</key>
 	<dict>
